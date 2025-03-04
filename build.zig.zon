@@ -1,6 +1,7 @@
 .{
-    .name = "zigsay",
+    .name = .zigsay,
     .version = "0.0.0",
+    .fingerprint = 0x2a2010f5a35a1890,
     .dependencies = .{},
     .paths = .{
         "build.zig",

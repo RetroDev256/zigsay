@@ -29,7 +29,10 @@ const lizard =
 ;
 
 pub fn main() !void {
-    const allocator = std.heap.page_allocator;
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
+    defer assert(gpa.deinit() == .ok);
+
+    const allocator = gpa.allocator();
     var args_iter: std.process.ArgIterator = try .initWithAllocator(allocator);
     defer args_iter.deinit();
 
@@ -56,7 +59,9 @@ pub fn main() !void {
     }
 
     const stdout = std.io.getStdOut().writer();
-    try sayWithReader(allocator, stdout, words.items);
+    var bw = std.io.bufferedWriter(stdout);
+    try sayWithReader(allocator, bw.writer(), words.items);
+    try bw.flush();
 }
 
 fn sayWithReader(allocator: Allocator, writer: anytype, raw_input: []const u8) !void {
