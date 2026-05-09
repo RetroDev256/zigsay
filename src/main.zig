@@ -1,14 +1,9 @@
 const std = @import("std");
-const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
-const StringList = std.ArrayListUnmanaged(u8);
+const assert = std.debug.assert;
+const Io = std.Io;
 
-// Change this to whatever you wish for your terminal
-const terminal_width = 50;
-comptime {
-    // The lizard must be able to fit inside the terminal
-    assert(lizard_width < terminal_width);
-}
+const term_width = 80;
 const lizard_width = 24;
 const lizard =
     \\    \  _
@@ -28,150 +23,174 @@ const lizard =
     \\
 ;
 
-pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer assert(gpa.deinit() == .ok);
+pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    const args = try init.minimal.args.toSlice(arena);
 
-    const allocator = gpa.allocator();
-    var args_iter: std.process.ArgIterator = try .initWithAllocator(allocator);
-    defer args_iter.deinit();
+    if (args.len > 1) {
+        // buffered STDOUT writer
+        const stdout = Io.File.stdout();
+        var buffer: [4096]u8 = undefined;
+        var file_writer = stdout.writer(init.io, &buffer);
+        const writer: *Io.Writer = &file_writer.interface;
 
-    // skip the executable name
-    assert(args_iter.skip());
+        // main zigsay algorithm
+        try say(init.gpa, writer, args[1..]);
 
-    var words: StringList = .empty;
-    defer words.deinit(allocator);
-
-    if (args_iter.next()) |first| {
-        try words.appendSlice(allocator, first);
-        while (args_iter.next()) |next| {
-            // arguments are typically space separated
-            try words.append(allocator, ' ');
-            try words.appendSlice(allocator, next);
-        }
+        // flush STDOUT
+        try writer.flush();
     } else {
-        // no user input was supplied, use stdin instead
-        const stdin = std.io.getStdIn().reader();
-        while (true) {
-            const byte = stdin.readByte() catch break;
-            try words.append(allocator, byte);
-        }
+        std.debug.print("USAGE: {s} <message>\n", .{
+            if (args.len == 0) "zigsay" else args[0],
+        });
+        std.process.exit(1);
     }
-
-    const stdout = std.io.getStdOut().writer();
-    var bw = std.io.bufferedWriter(stdout);
-    try sayWithReader(allocator, bw.writer(), words.items);
-    try bw.flush();
 }
 
-fn sayWithReader(allocator: Allocator, writer: anytype, raw_input: []const u8) !void {
-    const line_len = terminal_width - 4;
+// main zigsay algorithm
+fn say(gpa: Allocator, writer: *Io.Writer, args: []const []const u8) !void {
 
-    const sanitized = try sanitizeInput(allocator, raw_input);
-    defer allocator.free(sanitized);
-    const line_broken = try lineBreakInput(allocator, sanitized, line_len);
-    defer allocator.free(line_broken);
+    // Allow a gap for a border and whitespace
+    const line_length = term_width - 4;
+    const lines = try lineBreak(gpa, args, line_length);
+    defer gpa.free(lines);
+    defer for (lines) |line| gpa.free(line);
 
-    const line_count = (line_broken.len + line_len - 1) / line_len;
+    switch (lines.len) {
+        0 => {},
+        1 => {
+            // Top border of the message block
+            try triple(writer, " ", '_', lines[0].len + 2, "\n");
 
-    if (line_count > 0) {
-        try topAndBottomPrint(writer, line_broken.len, '_');
-        if (line_count == 1) {
-            // Single line, easy case
+            // Line content
             try writer.writeAll("< ");
-            try writer.writeAll(line_broken);
+            try writer.writeAll(lines[0]);
             try writer.writeAll(" >\n");
-        } else {
-            // More complex, use / and | and \
-            var line_number: usize = 0;
-            while (line_number < line_count) : (line_number += 1) {
-                const line_start: usize = line_number * line_len;
-                const remainder = line_broken[line_start..];
-                if (line_number == line_count - 1) {
-                    const padding = line_len - remainder.len;
+
+            // Bottom border of the message block
+            try triple(writer, " ", '-', lines[0].len + 2, "\n");
+        },
+        else => {
+            // Top border of the message block
+            try triple(writer, " ", '_', term_width - 2, "\n");
+
+            for (lines, 0..) |line, idx| {
+                // Left border of the message block
+                if (idx == 0) {
+                    try writer.writeAll("/ ");
+                } else if (idx + 1 == lines.len) {
                     try writer.writeAll("\\ ");
-                    try writer.writeAll(remainder);
-                    try writer.writeByteNTimes(' ', padding);
+                } else {
+                    try writer.writeAll("| ");
+                }
+
+                // Line content
+                try writer.writeAll(line);
+
+                // Padding to flush out line length
+                const padding = line_length - line.len;
+                try writer.splatByteAll(' ', padding);
+
+                // Right border of the message block
+                if (idx == 0) {
+                    try writer.writeAll(" \\\n");
+                } else if (idx + 1 == lines.len) {
                     try writer.writeAll(" /\n");
                 } else {
-                    const line = remainder[0..line_len];
-                    if (line_number == 0) {
-                        try writer.writeAll("/ ");
-                        try writer.writeAll(line);
-                        try writer.writeAll(" \\\n");
-                    } else {
-                        try writer.writeAll("| ");
-                        try writer.writeAll(line);
-                        try writer.writeAll(" |\n");
-                    }
+                    try writer.writeAll(" |\n");
                 }
             }
-        }
-        try topAndBottomPrint(writer, line_broken.len, '-');
+
+            // Bottom border of the message block
+            try triple(writer, " ", '-', term_width - 2, "\n");
+        },
     }
+
     try writer.writeAll(lizard);
 }
 
-fn sanitizeInput(allocator: Allocator, input: []const u8) ![]const u8 {
-    var result: StringList = try .initCapacity(allocator, input.len);
-    defer result.deinit(allocator);
-    for (input) |byte| {
-        if (std.ascii.isWhitespace(byte)) {
-            result.appendAssumeCapacity(' ');
-        } else if (std.ascii.isPrint(byte)) {
-            result.appendAssumeCapacity(byte);
-        } else {
-            result.appendAssumeCapacity('?');
-        }
-    }
-    return try result.toOwnedSlice(allocator);
+fn triple(
+    writer: *Io.Writer,
+    start: []const u8,
+    byte: u8,
+    splat: usize,
+    end: []const u8,
+) !void {
+    try writer.writeAll(start);
+    try writer.splatByteAll(byte, splat);
+    try writer.writeAll(end);
 }
 
-// Doesn't actually insert newlines, just pads lines using spaces
-fn lineBreakInput(allocator: Allocator, input: []const u8, line_len: usize) ![]const u8 {
-    var result: StringList = .empty;
-    defer result.deinit(allocator);
-    var space_splitter = std.mem.tokenizeScalar(u8, input, ' ');
-    var current_len: usize = 0;
-    while (space_splitter.next()) |word| {
-        if (current_len + 1 + word.len >= line_len) {
-            // The line would be too long - split it up:
-            if (word.len <= line_len) {
-                const next_line_pad = line_len - current_len;
-                const line_padding = next_line_pad % line_len;
-                try result.appendNTimes(allocator, ' ', line_padding);
-                try result.appendSlice(allocator, word);
-                current_len = word.len % line_len;
+// simple linebreak algorithm for some number
+// of arguments, and a target line length
+fn lineBreak(
+    gpa: Allocator,
+    args: []const []const u8,
+    line_length: usize,
+) ![]const []const u8 {
+    // Each line has at most line_length bytes
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(gpa);
+    // The buffer holding an individual line
+    const buffer = try gpa.alloc(u8, line_length);
+    defer gpa.free(buffer);
+    // The writer & current word for a line
+    var writer = Io.Writer.fixed(buffer);
+    var word: []const u8 = &.{};
+    var idx: usize = 0;
+
+    fsa: switch (enum { start, load }.start) {
+        .start => {
+            if (word.len == 0) {
+                // load a word if we still have one left
+                if (idx < args.len) continue :fsa .load;
+            } else if (writer.end + word.len <= line_length) {
+                // write out the word to the current line
+                try writer.writeAll(word);
+
+                if (idx < args.len) {
+                    // write out a space after the word
+                    if (writer.end + 1 < line_length) {
+                        try writer.writeByte(' ');
+                    }
+
+                    // load another word
+                    continue :fsa .load;
+                }
             } else {
-                var remaining = word;
-                if (current_len > 0) {
-                    const start_len = line_len - (current_len + 1);
-                    try result.append(allocator, ' ');
-                    try result.appendSlice(allocator, remaining[0..start_len]);
-                    remaining = remaining[start_len..];
+                if (word.len > line_length) {
+                    // split the word to the line length
+                    const len = line_length - writer.end;
+                    try writer.writeAll(word[0..len]);
+                    word = word[len..];
                 }
-                while (remaining.len > line_len) {
-                    try result.appendSlice(allocator, remaining[0..line_len]);
-                    remaining = remaining[line_len..];
-                }
-                try result.appendSlice(allocator, remaining);
-                current_len = remaining.len % line_len;
-            }
-        } else if (current_len > 0) {
-            try result.append(allocator, ' ');
-            try result.appendSlice(allocator, word);
-            current_len += 1 + word.len;
-        } else {
-            try result.appendSlice(allocator, word);
-            current_len += word.len;
-        }
-    }
-    return try result.toOwnedSlice(allocator);
-}
 
-fn topAndBottomPrint(writer: anytype, input_len: usize, symbol: u8) !void {
-    const line_len = @min(terminal_width, input_len + 4);
-    try writer.writeByte(' ');
-    try writer.writeByteNTimes(symbol, line_len - 2);
-    try writer.writeAll(" \n");
+                // store and clear the current line
+                const line = writer.buffered();
+                const dupe = try gpa.dupe(u8, line);
+                try lines.append(gpa, dupe);
+                writer.end = 0;
+
+                // go back to start
+                continue :fsa .start;
+            }
+        },
+        .load => {
+            // load a word
+            word = args[idx];
+            idx += 1;
+
+            // go back to start
+            continue :fsa .start;
+        },
+    }
+
+    if (writer.end > 0) {
+        // store the current line
+        const line = writer.buffered();
+        const dupe = try gpa.dupe(u8, line);
+        try lines.append(gpa, dupe);
+    }
+
+    return try lines.toOwnedSlice(gpa);
 }
